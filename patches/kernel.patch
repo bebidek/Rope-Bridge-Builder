@@ -1,0 +1,1523 @@
+diff --git a/arch/x86/Kbuild b/arch/x86/Kbuild
+index cf0ad89..c6e44ca 100644
+--- a/arch/x86/Kbuild
++++ b/arch/x86/Kbuild
+@@ -30,5 +30,7 @@ obj-$(CONFIG_KEXEC_FILE) += purgatory/
+ 
+ obj-y += virt/
+ 
++obj-y += rbb/
++
+ # for cleaning
+ subdir- += boot tools
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index a396f6e..d93006a 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -385,6 +385,9 @@
+ 461	common	lsm_list_modules	sys_lsm_list_modules
+ 462 	common  mseal			sys_mseal
+ 
++470 64      rbb_setup           sys_rbb_setup
++471 64      rbb_enter           sys_rbb_enter
++
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+ # in x32 as compared to native x86_64.  These syscalls have numbers 512-547.
+diff --git a/arch/x86/kernel/sys_x86_64.c b/arch/x86/kernel/sys_x86_64.c
+index 01d7cd8..2cf5d80 100644
+--- a/arch/x86/kernel/sys_x86_64.c
++++ b/arch/x86/kernel/sys_x86_64.c
+@@ -76,16 +76,21 @@ static int __init control_va_addr_alignment(char *str)
+ }
+ __setup("align_va_addr=", control_va_addr_alignment);
+ 
+-SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+-		unsigned long, prot, unsigned long, flags,
+-		unsigned long, fd, unsigned long, off)
+-{
++long rbb_ksys_mmap(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long);
++long rbb_ksys_mmap(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long fd, unsigned long off) {
+ 	if (off & ~PAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+ }
+ 
++SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
++		unsigned long, prot, unsigned long, flags,
++		unsigned long, fd, unsigned long, off)
++{
++	return rbb_ksys_mmap(addr, len, prot, flags, fd, off);
++}
++
+ static void find_start_end(unsigned long addr, unsigned long flags,
+ 		unsigned long *begin, unsigned long *end)
+ {
+diff --git a/arch/x86/rbb/Makefile b/arch/x86/rbb/Makefile
+new file mode 100644
+index 0000000..d638704
+--- /dev/null
++++ b/arch/x86/rbb/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-y				:= rbb.o
+diff --git a/arch/x86/rbb/rbb.c b/arch/x86/rbb/rbb.c
+new file mode 100644
+index 0000000..d9d8bdd
+--- /dev/null
++++ b/arch/x86/rbb/rbb.c
+@@ -0,0 +1,237 @@
++#define pr_fmt(fmt) "RBB: " fmt
++
++#include <linux/syscalls.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/uaccess.h>
++#include <linux/execmem.h>
++#include <linux/slab.h>
++#include <linux/printk.h>
++#include <linux/mm.h>
++#include <linux/vmalloc.h>
++#include <linux/set_memory.h>
++#include <linux/compiler_attributes.h>
++#include <asm/processor.h>
++
++#define MAX_BLOB_SIZE (1024*1024*1)
++#define ENTRY_OFFSET (4*8)
++
++extern long rbb_ksys_read(unsigned int, char*, size_t);
++extern long rbb_ksys_write(unsigned int, const char*, size_t);
++extern long rbb_ksys_open(const char*, int, umode_t);
++extern long rbb_ksys_close(unsigned int);
++extern long rbb_ksys_newstat(const char *, struct stat *);
++extern long rbb_ksys_newfstat(unsigned int, struct stat*);
++extern long rbb_ksys_newlstat(const char *, struct stat *);
++extern long rbb_ksys_lseek(unsigned int, off_t, unsigned int);
++extern long rbb_ksys_mmap(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long);
++extern long rbb_ksys_mprotect(unsigned long, size_t, unsigned long);
++extern long rbb_ksys_rt_sigprocmask(int, sigset_t*, sigset_t*, size_t);
++extern long rbb_ksys_ioctl(unsigned int, unsigned int, unsigned long);
++extern long rbb_ksys_writev(unsigned long, const struct iovec*, unsigned long);
++extern long rbb_ksys_madvise(unsigned long, size_t, int);
++extern long rbb_ksys_getpid(void);
++extern long rbb_ksys_sendfile64(int, int, loff_t*, size_t);
++extern long rbb_ksys_socket(int, int, int);
++extern long rbb_ksys_sendto(int, void*, size_t, unsigned int, struct sockaddr*, int);
++extern long rbb_ksys_recvfrom(int, void*, size_t, unsigned int, struct sockaddr*, int*);
++extern long rbb_ksys_bind(int, struct sockaddr*, int);
++extern long rbb_ksys_setsockopt(int, int, int, char*, int);
++extern long rbb_ksys_clone(unsigned long, unsigned long, int*, int*, unsigned long);
++extern long rbb_ksys_exit(int);
++extern long rbb_ksys_wait4(pid_t, int*, int, struct rusage*);
++extern long rbb_ksys_fcntl(unsigned int, unsigned int, unsigned long);
++extern long rbb_ksys_chdir(const char*);
++extern long rbb_ksys_mkdir(const char*, umode_t);
++extern long rbb_ksys_unlink(const char*);
++extern long rbb_ksys_readlink(const char*, char*, int);
++extern long rbb_ksys_chown(const char*, uid_t, gid_t);
++extern long rbb_ksys_umask(int);
++extern long rbb_ksys_gettimeofday(struct __kernel_old_timeval*, struct timezone*);
++extern long rbb_ksys_geteuid(void);
++extern long rbb_ksys_setpgid(pid_t, pid_t);
++extern long rbb_ksys_getppid(void);
++extern long rbb_ksys_chroot(const char*);
++extern long rbb_ksys_time(__kernel_old_time_t*);
++extern long rbb_ksys_futex(u32*, int, u32, const struct __kernel_timespec*, u32*, u32);
++extern long rbb_ksys_getdents64(unsigned int, struct linux_dirent64*, unsigned int);
++extern long rbb_ksys_clock_gettime(const clockid_t, struct __kernel_timespec*);
++extern long rbb_ksys_exit_group(int);
++extern long rbb_ksys_epoll_wait(int, struct epoll_event*, int, int);
++extern long rbb_ksys_epoll_ctl(int, int, int, struct epoll_event*);
++extern long rbb_ksys_utimes(char*, struct __kernel_old_timeval*);
++extern long rbb_ksys_openat(int, const char*, int, umode_t);
++extern long rbb_ksys_newfstatat(int, const char*, struct stat*, int);
++extern long rbb_ksys_pselect6(int, fd_set*, fd_set*, fd_set*, struct __kernel_timespec*, void*);
++extern long rbb_ksys_set_robust_list(struct robust_list_head*, size_t);
++extern long rbb_ksys_utimensat(int, const char*, struct __kernel_timespec*, int);
++extern long rbb_ksys_timerfd_create(int, int);
++extern long rbb_ksys_timerfd_settime(int, int, const struct __kernel_itimerspec*, struct __kernel_itimerspec*);
++extern long rbb_ksys_accept4(int, struct sockaddr*, int*, int);
++extern long rbb_ksys_epoll_create1(int);
++
++extern void __noreturn do_exit(long);
++uint64_t sc_tab[512];
++
++static int __init init_sc_tab(void) {
++	for (int i=0; i<512; i++)
++		sc_tab[i] = 0;
++	sc_tab[0] = (uint64_t)rbb_ksys_read;
++	sc_tab[1] = (uint64_t)rbb_ksys_write;
++	sc_tab[2] = (uint64_t)rbb_ksys_open;
++	sc_tab[3] = (uint64_t)rbb_ksys_close;
++	sc_tab[4] = (uint64_t)rbb_ksys_newstat;
++	sc_tab[5] = (uint64_t)rbb_ksys_newfstat;
++	sc_tab[6] = (uint64_t)rbb_ksys_newlstat;
++	sc_tab[8] = (uint64_t)rbb_ksys_lseek;
++	sc_tab[9] = (uint64_t)rbb_ksys_mmap;
++	sc_tab[10] = (uint64_t)rbb_ksys_mprotect;
++	sc_tab[14] = (uint64_t)rbb_ksys_rt_sigprocmask;
++	sc_tab[16] = (uint64_t)rbb_ksys_ioctl;
++	sc_tab[20] = (uint64_t)rbb_ksys_writev;
++	sc_tab[28] = (uint64_t)rbb_ksys_madvise;
++	sc_tab[39] = (uint64_t)rbb_ksys_getpid;
++	sc_tab[40] = (uint64_t)rbb_ksys_sendfile64;
++	sc_tab[41] = (uint64_t)rbb_ksys_socket;
++	sc_tab[44] = (uint64_t)rbb_ksys_sendto;
++	sc_tab[45] = (uint64_t)rbb_ksys_recvfrom;
++	sc_tab[49] = (uint64_t)rbb_ksys_bind;
++	sc_tab[54] = (uint64_t)rbb_ksys_setsockopt;
++	/* sc_tab[56] = (uint64_t)rbb_ksys_clone; */ // causes crashes
++	sc_tab[60] = (uint64_t)rbb_ksys_exit;
++	sc_tab[61] = (uint64_t)rbb_ksys_wait4;
++	sc_tab[72] = (uint64_t)rbb_ksys_fcntl;
++	sc_tab[80] = (uint64_t)rbb_ksys_chdir;
++	sc_tab[83] = (uint64_t)rbb_ksys_mkdir;
++	sc_tab[87] = (uint64_t)rbb_ksys_unlink;
++	sc_tab[89] = (uint64_t)rbb_ksys_readlink;
++	sc_tab[92] = (uint64_t)rbb_ksys_chown;
++	sc_tab[95] = (uint64_t)rbb_ksys_umask;
++	sc_tab[96] = (uint64_t)rbb_ksys_gettimeofday;
++	sc_tab[107] = (uint64_t)rbb_ksys_geteuid;
++	sc_tab[109] = (uint64_t)rbb_ksys_setpgid;
++	sc_tab[110] = (uint64_t)rbb_ksys_getppid;
++	sc_tab[161] = (uint64_t)rbb_ksys_chroot;
++	sc_tab[201] = (uint64_t)rbb_ksys_time;
++	sc_tab[202] = (uint64_t)rbb_ksys_futex;
++	sc_tab[217] = (uint64_t)rbb_ksys_getdents64;
++	sc_tab[228] = (uint64_t)rbb_ksys_clock_gettime;
++	sc_tab[231] = (uint64_t)rbb_ksys_exit_group;
++	sc_tab[232] = (uint64_t)rbb_ksys_epoll_wait;
++	sc_tab[233] = (uint64_t)rbb_ksys_epoll_ctl;
++	sc_tab[235] = (uint64_t)rbb_ksys_utimes;
++	sc_tab[257] = (uint64_t)rbb_ksys_openat;
++	sc_tab[262] = (uint64_t)rbb_ksys_newfstatat;
++	sc_tab[270] = (uint64_t)rbb_ksys_pselect6;
++	sc_tab[273] = (uint64_t)rbb_ksys_set_robust_list;
++	sc_tab[280] = (uint64_t)rbb_ksys_utimensat;
++	sc_tab[283] = (uint64_t)rbb_ksys_timerfd_create;
++	sc_tab[286] = (uint64_t)rbb_ksys_timerfd_settime;
++	sc_tab[288] = (uint64_t)rbb_ksys_accept4;
++	sc_tab[291] = (uint64_t)rbb_ksys_epoll_create1;
++	return 0;
++}
++
++late_initcall(init_sc_tab);
++
++
++
++typedef unsigned long(*blob_func_t)(void*, void*, void*, void*, void*, void*, struct pt_regs*);
++uint8_t *blob_buf = NULL;
++
++static noinline void kill_func(uint64_t *interface_buf) {
++	pr_info("Killing process due to unexpected behavior%c\n", interface_buf ? ':' : '.');
++	if (interface_buf != NULL) {
++		const char* regs[16] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"};
++		for (int i=0; i<16; i++)
++			pr_info("\t%s = %llx\n", regs[i], interface_buf[i]);
++	}
++	do_exit(42 << 8);
++}
++
++static noinline void print_path_length(uint64_t value) {
++	pr_info("Exiting the blob after executing %llu instruction equivalents\n", value);
++}
++
++static noinline void print_pseudo_syscall(uint64_t arg1, uint64_t arg2, uint64_t arg3, uint64_t arg4, uint64_t arg5, uint64_t arg6, uint64_t call_no) {
++	pr_info("Calling pseudo-syscall %llu with args (%llu, %llu, %llu, %llu, %llu, %llu)\n", call_no, arg1, arg2, arg3, arg4, arg5, arg6);
++}
++
++
++/*
++ * Syscall 'rbb_setup' - loads and prepares the blob
++ */
++static int do_rbb_setup(uint8_t __user *buffer, size_t buffer_len)
++{
++	int ret = 0;
++
++	// basic checks
++	if (buffer_len <= ENTRY_OFFSET || buffer_len > MAX_BLOB_SIZE) {
++		ret = -EINVAL;
++		goto rollback_return;
++	}
++
++	// retrieve the blob
++	size_t num_of_blob_pages = (PAGE_SIZE - 1 + buffer_len) / PAGE_SIZE;
++	uint8_t *new_blob_buf = execmem_alloc(EXECMEM_DEFAULT, PAGE_SIZE * num_of_blob_pages);
++	if (!new_blob_buf) {
++		ret = -ENOMEM;
++		goto rollback_return;
++	}
++	if (copy_from_user(new_blob_buf, buffer, buffer_len)) {
++		ret = -EFAULT;
++		goto rollback_free_new_blob;
++	}
++
++	// apply relocations
++	*(uint64_t*)(new_blob_buf) = (uint64_t)sc_tab;
++	*(uint64_t*)(new_blob_buf+8) = (uint64_t)kill_func;
++	*(uint64_t*)(new_blob_buf+16) = (uint64_t)print_path_length;
++	*(uint64_t*)(new_blob_buf+24) = (uint64_t)print_pseudo_syscall;
++
++	// make memory executable
++	if ((ret = set_memory_rox((unsigned long)new_blob_buf, num_of_blob_pages))) {
++		goto rollback_free_new_blob;
++	}
++
++	// set global variables
++	if (blob_buf)
++		execmem_free(blob_buf);
++	set_vm_flush_reset_perms(new_blob_buf);
++	blob_buf = new_blob_buf;
++
++	pr_info("Blob setup successful, size = %zu B\n", buffer_len);
++	return 0;
++
++	// error rollback
++rollback_free_new_blob:
++	execmem_free(new_blob_buf);
++rollback_return:
++	pr_info("Blob setup failed\n");
++	return ret;
++}
++
++SYSCALL_DEFINE2(rbb_setup, uint8_t __user*, buffer, size_t, buffer_len)
++{
++	return do_rbb_setup(buffer, buffer_len);
++}
++
++
++
++/*
++ * Syscall 'rbb_enter' - switches execution to the blob
++ */
++static unsigned long do_rbb_enter(void* arg1, void* arg2, void* arg3, void* arg4, void* arg5, void* arg6)
++{
++	if (unlikely(!blob_buf)) {
++		pr_warn("Attempted to enter an uninitialized blob\n");
++		kill_func(NULL);
++	}
++
++	return ((blob_func_t)(blob_buf+ENTRY_OFFSET))(arg1, arg2, arg3, arg4, arg5, arg6, task_pt_regs(current));
++}
++
++SYSCALL_DEFINE6(rbb_enter, void*, arg1, void*, arg2, void*, arg3, void*, arg4, void*, arg5, void*, arg6)
++{
++	return do_rbb_enter(arg1, arg2, arg3, arg4, arg5, arg6);
++}
+diff --git a/arch/x86/um/syscalls_64.c b/arch/x86/um/syscalls_64.c
+index 6a00a28..cdfcc29 100644
+--- a/arch/x86/um/syscalls_64.c
++++ b/arch/x86/um/syscalls_64.c
+@@ -53,12 +53,17 @@ void arch_switch_to(struct task_struct *to)
+ 	 */
+ }
+ 
+-SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
+-		unsigned long, prot, unsigned long, flags,
+-		unsigned long, fd, unsigned long, off)
+-{
++long rbb_ksys_mmap(unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long);
++long rbb_ksys_mmap(unsigned long addr, unsigned long len, unsigned long prot, unsigned long flags, unsigned long fd, unsigned long off) {
+ 	if (off & ~PAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	return ksys_mmap_pgoff(addr, len, prot, flags, fd, off >> PAGE_SHIFT);
+ }
++
++SYSCALL_DEFINE6(mmap, unsigned long, addr, unsigned long, len,
++		unsigned long, prot, unsigned long, flags,
++		unsigned long, fd, unsigned long, off)
++{
++	return rbb_ksys_mmap(addr, len, prot, flags, fd, off);
++}
+diff --git a/fs/eventpoll.c b/fs/eventpoll.c
+index f53ca4f..dd19f83 100644
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -2216,11 +2216,17 @@ static int do_epoll_create(int flags)
+ 	return error;
+ }
+ 
+-SYSCALL_DEFINE1(epoll_create1, int, flags)
++long rbb_ksys_epoll_create1(int);
++long rbb_ksys_epoll_create1(int flags)
+ {
+ 	return do_epoll_create(flags);
+ }
+ 
++SYSCALL_DEFINE1(epoll_create1, int, flags)
++{
++	return rbb_ksys_epoll_create1(flags);
++}
++
+ SYSCALL_DEFINE1(epoll_create, int, size)
+ {
+ 	if (size <= 0)
+@@ -2410,8 +2416,8 @@ int do_epoll_ctl(int epfd, int op, int fd, struct epoll_event *epds,
+  * the eventpoll file that enables the insertion/removal/change of
+  * file descriptors inside the interest set.
+  */
+-SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
+-		struct epoll_event __user *, event)
++long rbb_ksys_epoll_ctl(int, int, int, struct epoll_event*);
++long rbb_ksys_epoll_ctl(int epfd, int op, int fd, struct epoll_event __user* event)
+ {
+ 	struct epoll_event epds;
+ 
+@@ -2422,6 +2428,12 @@ SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
+ 	return do_epoll_ctl(epfd, op, fd, &epds, false);
+ }
+ 
++SYSCALL_DEFINE4(epoll_ctl, int, epfd, int, op, int, fd,
++		struct epoll_event __user *, event)
++{
++	return rbb_ksys_epoll_ctl(epfd, op, fd, event);
++}
++
+ /*
+  * Implement the event wait interface for the eventpoll file. It is the kernel
+  * part of the user space epoll_wait(2).
+@@ -2468,8 +2480,8 @@ static int do_epoll_wait(int epfd, struct epoll_event __user *events,
+ 	return error;
+ }
+ 
+-SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
+-		int, maxevents, int, timeout)
++long rbb_ksys_epoll_wait(int, struct epoll_event*, int, int);
++long rbb_ksys_epoll_wait(int epfd, struct epoll_event __user *events, int maxevents, int timeout)
+ {
+ 	struct timespec64 to;
+ 
+@@ -2477,6 +2489,12 @@ SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
+ 			     ep_timeout_to_timespec(&to, timeout));
+ }
+ 
++SYSCALL_DEFINE4(epoll_wait, int, epfd, struct epoll_event __user *, events,
++		int, maxevents, int, timeout)
++{
++	return rbb_ksys_epoll_wait(epfd, events, maxevents, timeout);
++}
++
+ /*
+  * Implement the event wait interface for the eventpoll file. It is the kernel
+  * part of the user space epoll_pwait(2).
+diff --git a/fs/fcntl.c b/fs/fcntl.c
+index 300e5d9..57cb032 100644
+--- a/fs/fcntl.c
++++ b/fs/fcntl.c
+@@ -474,8 +474,9 @@ static int check_fcntl_cmd(unsigned cmd)
+ 	return 0;
+ }
+ 
+-SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+-{	
++long rbb_ksys_fcntl(unsigned int, unsigned int, unsigned long);
++long rbb_ksys_fcntl(unsigned int fd, unsigned int cmd, unsigned long arg)
++{
+ 	struct fd f = fdget_raw(fd);
+ 	long err = -EBADF;
+ 
+@@ -497,6 +498,11 @@ SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+ 	return err;
+ }
+ 
++SYSCALL_DEFINE3(fcntl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
++{	
++	return rbb_ksys_fcntl(fd, cmd, arg);
++}
++
+ #if BITS_PER_LONG == 32
+ SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
+ 		unsigned long, arg)
+diff --git a/fs/ioctl.c b/fs/ioctl.c
+index 6477689..dffce4e 100644
+--- a/fs/ioctl.c
++++ b/fs/ioctl.c
+@@ -890,7 +890,8 @@ static int do_vfs_ioctl(struct file *filp, unsigned int fd,
+ 	return -ENOIOCTLCMD;
+ }
+ 
+-SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
++long rbb_ksys_ioctl(unsigned int, unsigned int, unsigned long);
++long rbb_ksys_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg)
+ {
+ 	struct fd f = fdget(fd);
+ 	int error;
+@@ -911,6 +912,11 @@ SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+ 	return error;
+ }
+ 
++SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
++{
++	return rbb_ksys_ioctl(fd, cmd, arg);
++}
++
+ #ifdef CONFIG_COMPAT
+ /**
+  * compat_ptr_ioctl - generic implementation of .compat_ioctl file operation
+diff --git a/fs/namei.c b/fs/namei.c
+index 1e05a0f..3dbc3ef 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -4175,11 +4175,17 @@ SYSCALL_DEFINE3(mkdirat, int, dfd, const char __user *, pathname, umode_t, mode)
+ 	return do_mkdirat(dfd, getname(pathname), mode);
+ }
+ 
+-SYSCALL_DEFINE2(mkdir, const char __user *, pathname, umode_t, mode)
++long rbb_ksys_mkdir(const char*, umode_t);
++long rbb_ksys_mkdir(const char __user *pathname, umode_t mode)
+ {
+ 	return do_mkdirat(AT_FDCWD, getname(pathname), mode);
+ }
+ 
++SYSCALL_DEFINE2(mkdir, const char __user *, pathname, umode_t, mode)
++{
++	return rbb_ksys_mkdir(pathname, mode);
++}
++
+ /**
+  * vfs_rmdir - remove directory
+  * @idmap:	idmap of the mount the inode was found from
+@@ -4456,11 +4462,17 @@ SYSCALL_DEFINE3(unlinkat, int, dfd, const char __user *, pathname, int, flag)
+ 	return do_unlinkat(dfd, getname(pathname));
+ }
+ 
+-SYSCALL_DEFINE1(unlink, const char __user *, pathname)
++long rbb_ksys_unlink(const char*);
++long rbb_ksys_unlink(const char __user *pathname)
+ {
+ 	return do_unlinkat(AT_FDCWD, getname(pathname));
+ }
+ 
++SYSCALL_DEFINE1(unlink, const char __user *, pathname)
++{
++	return rbb_ksys_unlink(pathname);
++}
++
+ /**
+  * vfs_symlink - create symlink
+  * @idmap:	idmap of the mount the inode was found from
+diff --git a/fs/open.c b/fs/open.c
+index 278b3ed..ea2f076 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -549,7 +549,8 @@ SYSCALL_DEFINE2(access, const char __user *, filename, int, mode)
+ 	return do_faccessat(AT_FDCWD, filename, mode, 0);
+ }
+ 
+-SYSCALL_DEFINE1(chdir, const char __user *, filename)
++long rbb_ksys_chdir(const char*);
++long rbb_ksys_chdir(const char __user *filename)
+ {
+ 	struct path path;
+ 	int error;
+@@ -575,6 +576,11 @@ SYSCALL_DEFINE1(chdir, const char __user *, filename)
+ 	return error;
+ }
+ 
++SYSCALL_DEFINE1(chdir, const char __user *, filename)
++{
++	return rbb_ksys_chdir(filename);
++}
++
+ SYSCALL_DEFINE1(fchdir, unsigned int, fd)
+ {
+ 	struct fd f = fdget_raw(fd);
+@@ -597,7 +603,8 @@ SYSCALL_DEFINE1(fchdir, unsigned int, fd)
+ 	return error;
+ }
+ 
+-SYSCALL_DEFINE1(chroot, const char __user *, filename)
++long rbb_ksys_chroot(const char*);
++long rbb_ksys_chroot(const char __user *filename)
+ {
+ 	struct path path;
+ 	int error;
+@@ -630,6 +637,11 @@ SYSCALL_DEFINE1(chroot, const char __user *, filename)
+ 	return error;
+ }
+ 
++SYSCALL_DEFINE1(chroot, const char __user *, filename)
++{
++	return rbb_ksys_chroot(filename);
++}
++
+ int chmod_common(const struct path *path, umode_t mode)
+ {
+ 	struct inode *inode = path->dentry->d_inode;
+@@ -836,11 +848,17 @@ SYSCALL_DEFINE5(fchownat, int, dfd, const char __user *, filename, uid_t, user,
+ 	return do_fchownat(dfd, filename, user, group, flag);
+ }
+ 
+-SYSCALL_DEFINE3(chown, const char __user *, filename, uid_t, user, gid_t, group)
++long rbb_ksys_chown(const char*, uid_t, gid_t);
++long rbb_ksys_chown(const char __user *filename, uid_t user, gid_t group)
+ {
+ 	return do_fchownat(AT_FDCWD, filename, user, group, 0);
+ }
+ 
++SYSCALL_DEFINE3(chown, const char __user *, filename, uid_t, user, gid_t, group)
++{
++	return rbb_ksys_chown(filename, user, group);
++}
++
+ SYSCALL_DEFINE3(lchown, const char __user *, filename, uid_t, user, gid_t, group)
+ {
+ 	return do_fchownat(AT_FDCWD, filename, user, group,
+@@ -1429,21 +1447,33 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
+ }
+ 
+ 
+-SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
++long rbb_ksys_open(const char*, int, umode_t);
++long rbb_ksys_open(const char __user *filename, int flags, umode_t mode)
+ {
+ 	if (force_o_largefile())
+ 		flags |= O_LARGEFILE;
+ 	return do_sys_open(AT_FDCWD, filename, flags, mode);
+ }
+ 
+-SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
+-		umode_t, mode)
++SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
++{
++	return rbb_ksys_open(filename, flags, mode);
++}
++
++long rbb_ksys_openat(int, const char*, int, umode_t);
++long rbb_ksys_openat(int dfd, const char __user *filename, int flags, umode_t mode)
+ {
+ 	if (force_o_largefile())
+ 		flags |= O_LARGEFILE;
+ 	return do_sys_open(dfd, filename, flags, mode);
+ }
+ 
++SYSCALL_DEFINE4(openat, int, dfd, const char __user *, filename, int, flags,
++		umode_t, mode)
++{
++	return rbb_ksys_openat(dfd, filename, flags, mode);
++}
++
+ SYSCALL_DEFINE4(openat2, int, dfd, const char __user *, filename,
+ 		struct open_how __user *, how, size_t, usize)
+ {
+@@ -1545,7 +1575,8 @@ EXPORT_SYMBOL(filp_close);
+  * releasing the fd. This ensures that one clone task can't release
+  * an fd while another clone is opening it.
+  */
+-SYSCALL_DEFINE1(close, unsigned int, fd)
++long rbb_ksys_close(unsigned int);
++long rbb_ksys_close(unsigned int fd)
+ {
+ 	int retval;
+ 	struct file *file;
+@@ -1572,6 +1603,11 @@ SYSCALL_DEFINE1(close, unsigned int, fd)
+ 	return retval;
+ }
+ 
++SYSCALL_DEFINE1(close, unsigned int, fd)
++{
++	return rbb_ksys_close(fd);
++}
++
+ /**
+  * sys_close_range() - Close all file descriptors in a given range.
+  *
+diff --git a/fs/read_write.c b/fs/read_write.c
+index ef63393..b454e6a 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -290,7 +290,8 @@ loff_t vfs_llseek(struct file *file, loff_t offset, int whence)
+ }
+ EXPORT_SYMBOL(vfs_llseek);
+ 
+-static off_t ksys_lseek(unsigned int fd, off_t offset, unsigned int whence)
++long rbb_ksys_lseek(unsigned int, off_t, unsigned int);
++long rbb_ksys_lseek(unsigned int fd, off_t offset, unsigned int whence)
+ {
+ 	off_t retval;
+ 	struct fd f = fdget_pos(fd);
+@@ -310,13 +311,13 @@ static off_t ksys_lseek(unsigned int fd, off_t offset, unsigned int whence)
+ 
+ SYSCALL_DEFINE3(lseek, unsigned int, fd, off_t, offset, unsigned int, whence)
+ {
+-	return ksys_lseek(fd, offset, whence);
++	return rbb_ksys_lseek(fd, offset, whence);
+ }
+ 
+ #ifdef CONFIG_COMPAT
+ COMPAT_SYSCALL_DEFINE3(lseek, unsigned int, fd, compat_off_t, offset, unsigned int, whence)
+ {
+-	return ksys_lseek(fd, offset, whence);
++	return rbb_ksys_lseek(fd, offset, whence);
+ }
+ #endif
+ 
+@@ -624,11 +625,17 @@ ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
+ 	return ret;
+ }
+ 
+-SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
++long rbb_ksys_read(unsigned int fd, char __user *buf, size_t count);
++long rbb_ksys_read(unsigned int fd, char __user *buf, size_t count)
+ {
+ 	return ksys_read(fd, buf, count);
+ }
+ 
++SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
++{
++	return rbb_ksys_read(fd, buf, count);
++}
++
+ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
+ {
+ 	struct fd f = fdget_pos(fd);
+@@ -649,10 +656,16 @@ ssize_t ksys_write(unsigned int fd, const char __user *buf, size_t count)
+ 	return ret;
+ }
+ 
++long rbb_ksys_write(unsigned int fd, const char __user *buf, size_t count);
++long rbb_ksys_write(unsigned int fd, const char __user *buf, size_t count)
++{
++	return ksys_write(fd, buf, count);
++}
++
+ SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
+ 		size_t, count)
+ {
+-	return ksys_write(fd, buf, count);
++	return rbb_ksys_write(fd, buf, count);
+ }
+ 
+ ssize_t ksys_pread64(unsigned int fd, char __user *buf, size_t count,
+@@ -1085,10 +1098,16 @@ SYSCALL_DEFINE3(readv, unsigned long, fd, const struct iovec __user *, vec,
+ 	return do_readv(fd, vec, vlen, 0);
+ }
+ 
++long rbb_ksys_writev(unsigned long, const struct iovec*, unsigned long);
++long rbb_ksys_writev(unsigned long fd, const struct iovec __user *vec, unsigned long vlen)
++{
++	return do_writev(fd, vec, vlen, 0);
++}
++
+ SYSCALL_DEFINE3(writev, unsigned long, fd, const struct iovec __user *, vec,
+ 		unsigned long, vlen)
+ {
+-	return do_writev(fd, vec, vlen, 0);
++	return rbb_ksys_writev(fd, vec, vlen);
+ }
+ 
+ SYSCALL_DEFINE5(preadv, unsigned long, fd, const struct iovec __user *, vec,
+@@ -1345,7 +1364,8 @@ SYSCALL_DEFINE4(sendfile, int, out_fd, int, in_fd, off_t __user *, offset, size_
+ 	return do_sendfile(out_fd, in_fd, NULL, count, 0);
+ }
+ 
+-SYSCALL_DEFINE4(sendfile64, int, out_fd, int, in_fd, loff_t __user *, offset, size_t, count)
++long rbb_ksys_sendfile64(int, int, loff_t*, size_t);
++long rbb_ksys_sendfile64(int out_fd, int in_fd, loff_t __user *offset, size_t count)
+ {
+ 	loff_t pos;
+ 	ssize_t ret;
+@@ -1362,6 +1382,11 @@ SYSCALL_DEFINE4(sendfile64, int, out_fd, int, in_fd, loff_t __user *, offset, si
+ 	return do_sendfile(out_fd, in_fd, NULL, count, 0);
+ }
+ 
++SYSCALL_DEFINE4(sendfile64, int, out_fd, int, in_fd, loff_t __user *, offset, size_t, count)
++{
++	return rbb_ksys_sendfile64(out_fd, in_fd, offset, count);
++}
++
+ #ifdef CONFIG_COMPAT
+ COMPAT_SYSCALL_DEFINE4(sendfile, int, out_fd, int, in_fd,
+ 		compat_off_t __user *, offset, compat_size_t, count)
+diff --git a/fs/readdir.c b/fs/readdir.c
+index 278bc02..42305db 100644
+--- a/fs/readdir.c
++++ b/fs/readdir.c
+@@ -391,8 +391,8 @@ static bool filldir64(struct dir_context *ctx, const char *name, int namlen,
+ 	return false;
+ }
+ 
+-SYSCALL_DEFINE3(getdents64, unsigned int, fd,
+-		struct linux_dirent64 __user *, dirent, unsigned int, count)
++long rbb_ksys_getdents64(unsigned int, struct linux_dirent64*, unsigned int);
++long rbb_ksys_getdents64(unsigned int fd, struct linux_dirent64 __user *dirent, unsigned int count)
+ {
+ 	struct fd f;
+ 	struct getdents_callback64 buf = {
+@@ -423,6 +423,12 @@ SYSCALL_DEFINE3(getdents64, unsigned int, fd,
+ 	return error;
+ }
+ 
++SYSCALL_DEFINE3(getdents64, unsigned int, fd,
++		struct linux_dirent64 __user *, dirent, unsigned int, count)
++{
++	return rbb_ksys_getdents64(fd, dirent, count);
++}
++
+ #ifdef CONFIG_COMPAT
+ struct compat_old_linux_dirent {
+ 	compat_ulong_t	d_ino;
+diff --git a/fs/select.c b/fs/select.c
+index 9515c3f..580b6d2 100644
+--- a/fs/select.c
++++ b/fs/select.c
+@@ -792,10 +792,8 @@ static inline int get_sigset_argpack(struct sigset_argpack *to,
+ 	return -EFAULT;
+ }
+ 
+-SYSCALL_DEFINE6(pselect6, int, n, fd_set __user *, inp, fd_set __user *, outp,
+-		fd_set __user *, exp, struct __kernel_timespec __user *, tsp,
+-		void __user *, sig)
+-{
++long rbb_ksys_pselect6(int, fd_set*, fd_set*, fd_set*, struct __kernel_timespec*, void*);
++long rbb_ksys_pselect6(int n, fd_set __user *inp, fd_set __user *outp, fd_set __user *exp, struct __kernel_timespec __user *tsp, void __user *sig) {
+ 	struct sigset_argpack x = {NULL, 0};
+ 
+ 	if (get_sigset_argpack(&x, sig))
+@@ -804,6 +802,13 @@ SYSCALL_DEFINE6(pselect6, int, n, fd_set __user *, inp, fd_set __user *, outp,
+ 	return do_pselect(n, inp, outp, exp, tsp, x.p, x.size, PT_TIMESPEC);
+ }
+ 
++SYSCALL_DEFINE6(pselect6, int, n, fd_set __user *, inp, fd_set __user *, outp,
++		fd_set __user *, exp, struct __kernel_timespec __user *, tsp,
++		void __user *, sig)
++{
++	return rbb_ksys_pselect6(n, inp, outp, exp, tsp, sig);
++}
++
+ #if defined(CONFIG_COMPAT_32BIT_TIME) && !defined(CONFIG_64BIT)
+ 
+ SYSCALL_DEFINE6(pselect6_time32, int, n, fd_set __user *, inp, fd_set __user *, outp,
+diff --git a/fs/stat.c b/fs/stat.c
+index 70bd3e8..4d1dc9d 100644
+--- a/fs/stat.c
++++ b/fs/stat.c
+@@ -434,8 +434,8 @@ static int cp_new_stat(struct kstat *stat, struct stat __user *statbuf)
+ 	return copy_to_user(statbuf,&tmp,sizeof(tmp)) ? -EFAULT : 0;
+ }
+ 
+-SYSCALL_DEFINE2(newstat, const char __user *, filename,
+-		struct stat __user *, statbuf)
++long rbb_ksys_newstat(const char *, struct stat *);
++long rbb_ksys_newstat(const char __user *filename, struct stat __user *statbuf)
+ {
+ 	struct kstat stat;
+ 	int error = vfs_stat(filename, &stat);
+@@ -445,8 +445,14 @@ SYSCALL_DEFINE2(newstat, const char __user *, filename,
+ 	return cp_new_stat(&stat, statbuf);
+ }
+ 
+-SYSCALL_DEFINE2(newlstat, const char __user *, filename,
++SYSCALL_DEFINE2(newstat, const char __user *, filename,
+ 		struct stat __user *, statbuf)
++{
++	return rbb_ksys_newstat(filename, statbuf);
++}
++
++long rbb_ksys_newlstat(const char *, struct stat *);
++long rbb_ksys_newlstat(const char __user *filename, struct stat __user *statbuf)
+ {
+ 	struct kstat stat;
+ 	int error;
+@@ -458,9 +464,15 @@ SYSCALL_DEFINE2(newlstat, const char __user *, filename,
+ 	return cp_new_stat(&stat, statbuf);
+ }
+ 
++SYSCALL_DEFINE2(newlstat, const char __user *, filename,
++		struct stat __user *, statbuf)
++{
++	return rbb_ksys_newlstat(filename, statbuf);
++}
++
+ #if !defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_SYS_NEWFSTATAT)
+-SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+-		struct stat __user *, statbuf, int, flag)
++long rbb_ksys_newfstatat(int, const char*, struct stat*, int);
++long rbb_ksys_newfstatat(int dfd, const char __user *filename, struct stat __user *statbuf, int flag)
+ {
+ 	struct kstat stat;
+ 	int error;
+@@ -470,9 +482,16 @@ SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
+ 		return error;
+ 	return cp_new_stat(&stat, statbuf);
+ }
++
++SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,
++		struct stat __user *, statbuf, int, flag)
++{
++	return rbb_ksys_newfstatat(dfd, filename, statbuf, flag);
++}
+ #endif
+ 
+-SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
++long rbb_ksys_newfstat(unsigned int, struct stat*);
++long rbb_ksys_newfstat(unsigned int fd, struct stat __user * statbuf)
+ {
+ 	struct kstat stat;
+ 	int error = vfs_fstat(fd, &stat);
+@@ -482,6 +501,11 @@ SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
+ 
+ 	return error;
+ }
++
++SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)
++{
++	return rbb_ksys_newfstat(fd, statbuf);
++}
+ #endif
+ 
+ static int do_readlinkat(int dfd, const char __user *pathname,
+@@ -526,10 +550,15 @@ SYSCALL_DEFINE4(readlinkat, int, dfd, const char __user *, pathname,
+ 	return do_readlinkat(dfd, pathname, buf, bufsiz);
+ }
+ 
++long rbb_ksys_readlink(const char*, char*, int);
++long rbb_ksys_readlink(const char __user *path, char __user *buf, int bufsiz) {
++	return do_readlinkat(AT_FDCWD, path, buf, bufsiz);
++}
++
+ SYSCALL_DEFINE3(readlink, const char __user *, path, char __user *, buf,
+ 		int, bufsiz)
+ {
+-	return do_readlinkat(AT_FDCWD, path, buf, bufsiz);
++	return rbb_ksys_readlink(path, buf, bufsiz);
+ }
+ 
+ 
+diff --git a/fs/timerfd.c b/fs/timerfd.c
+index 4bf2f8b..8703269 100644
+--- a/fs/timerfd.c
++++ b/fs/timerfd.c
+@@ -407,7 +407,8 @@ static int timerfd_fget(int fd, struct fd *p)
+ 	return 0;
+ }
+ 
+-SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
++long rbb_ksys_timerfd_create(int, int);
++long rbb_ksys_timerfd_create(int clockid, int flags)
+ {
+ 	int ufd;
+ 	struct timerfd_ctx *ctx;
+@@ -467,6 +468,11 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
+ 	return ufd;
+ }
+ 
++SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
++{
++	return rbb_ksys_timerfd_create(clockid, flags);
++}
++
+ static int do_timerfd_settime(int ufd, int flags, 
+ 		const struct itimerspec64 *new,
+ 		struct itimerspec64 *old)
+@@ -571,9 +577,8 @@ static int do_timerfd_gettime(int ufd, struct itimerspec64 *t)
+ 	return 0;
+ }
+ 
+-SYSCALL_DEFINE4(timerfd_settime, int, ufd, int, flags,
+-		const struct __kernel_itimerspec __user *, utmr,
+-		struct __kernel_itimerspec __user *, otmr)
++long rbb_ksys_timerfd_settime(int, int, const struct __kernel_itimerspec*, struct __kernel_itimerspec*);
++long rbb_ksys_timerfd_settime(int ufd, int flags, const struct __kernel_itimerspec __user *utmr, struct __kernel_itimerspec __user *otmr)
+ {
+ 	struct itimerspec64 new, old;
+ 	int ret;
+@@ -589,6 +594,13 @@ SYSCALL_DEFINE4(timerfd_settime, int, ufd, int, flags,
+ 	return ret;
+ }
+ 
++SYSCALL_DEFINE4(timerfd_settime, int, ufd, int, flags,
++		const struct __kernel_itimerspec __user *, utmr,
++		struct __kernel_itimerspec __user *, otmr)
++{
++	return rbb_ksys_timerfd_settime(ufd, flags, utmr, otmr);
++}
++
+ SYSCALL_DEFINE2(timerfd_gettime, int, ufd, struct __kernel_itimerspec __user *, otmr)
+ {
+ 	struct itimerspec64 kotmr;
+diff --git a/fs/utimes.c b/fs/utimes.c
+index 3701b39..d5943e4 100644
+--- a/fs/utimes.c
++++ b/fs/utimes.c
+@@ -145,8 +145,8 @@ long do_utimes(int dfd, const char __user *filename, struct timespec64 *times,
+ 	return do_utimes_path(dfd, filename, times, flags);
+ }
+ 
+-SYSCALL_DEFINE4(utimensat, int, dfd, const char __user *, filename,
+-		struct __kernel_timespec __user *, utimes, int, flags)
++long rbb_ksys_utimensat(int, const char*, struct __kernel_timespec*, int);
++long rbb_ksys_utimensat(int dfd, const char __user *filename, struct __kernel_timespec __user *utimes, int flags)
+ {
+ 	struct timespec64 tstimes[2];
+ 
+@@ -164,6 +164,12 @@ SYSCALL_DEFINE4(utimensat, int, dfd, const char __user *, filename,
+ 	return do_utimes(dfd, filename, utimes ? tstimes : NULL, flags);
+ }
+ 
++SYSCALL_DEFINE4(utimensat, int, dfd, const char __user *, filename,
++		struct __kernel_timespec __user *, utimes, int, flags)
++{
++	return rbb_ksys_utimensat(dfd, filename, utimes, flags);
++}
++
+ #ifdef __ARCH_WANT_SYS_UTIME
+ /*
+  * futimesat(), utimes() and utime() are older versions of utimensat()
+@@ -206,10 +212,16 @@ SYSCALL_DEFINE3(futimesat, int, dfd, const char __user *, filename,
+ 	return do_futimesat(dfd, filename, utimes);
+ }
+ 
++long rbb_ksys_utimes(char*, struct __kernel_old_timeval*);
++long rbb_ksys_utimes(char __user *filename, struct __kernel_old_timeval __user *utimes)
++{
++	return do_futimesat(AT_FDCWD, filename, utimes);
++}
++
+ SYSCALL_DEFINE2(utimes, char __user *, filename,
+ 		struct __kernel_old_timeval __user *, utimes)
+ {
+-	return do_futimesat(AT_FDCWD, filename, utimes);
++	return rbb_ksys_utimes(filename, utimes);
+ }
+ 
+ SYSCALL_DEFINE2(utime, char __user *, filename, struct utimbuf __user *, times)
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 81fcee4..bec1530 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -987,11 +987,17 @@ void __noreturn make_task_dead(int signr)
+ 	do_exit(signr);
+ }
+ 
+-SYSCALL_DEFINE1(exit, int, error_code)
++long rbb_ksys_exit(int);
++long rbb_ksys_exit(int error_code)
+ {
+ 	do_exit((error_code&0xff)<<8);
+ }
+ 
++SYSCALL_DEFINE1(exit, int, error_code)
++{
++	return rbb_ksys_exit(error_code);
++}
++
+ /*
+  * Take down every thread in the group.  This is called by fatal signals
+  * as well as by sys_exit_group (below).
+@@ -1031,13 +1037,19 @@ do_group_exit(int exit_code)
+  * wait4()-ing process will get the correct exit code - even if this
+  * thread is not the thread group leader.
+  */
+-SYSCALL_DEFINE1(exit_group, int, error_code)
++long rbb_ksys_exit_group(int);
++long rbb_ksys_exit_group(int error_code)
+ {
+ 	do_group_exit((error_code & 0xff) << 8);
+ 	/* NOTREACHED */
+ 	return 0;
+ }
+ 
++SYSCALL_DEFINE1(exit_group, int, error_code)
++{
++	return rbb_ksys_exit_group(error_code);
++}
++
+ static int eligible_pid(struct wait_opts *wo, struct task_struct *p)
+ {
+ 	return	wo->wo_type == PIDTYPE_MAX ||
+@@ -1809,8 +1821,8 @@ int kernel_wait(pid_t pid, int *stat)
+ 	return ret;
+ }
+ 
+-SYSCALL_DEFINE4(wait4, pid_t, upid, int __user *, stat_addr,
+-		int, options, struct rusage __user *, ru)
++long rbb_ksys_wait4(pid_t, int*, int, struct rusage*);
++long rbb_ksys_wait4(pid_t upid, int __user *stat_addr, int options, struct rusage __user *ru)
+ {
+ 	struct rusage r;
+ 	long err = kernel_wait4(upid, stat_addr, options, ru ? &r : NULL);
+@@ -1822,6 +1834,12 @@ SYSCALL_DEFINE4(wait4, pid_t, upid, int __user *, stat_addr,
+ 	return err;
+ }
+ 
++SYSCALL_DEFINE4(wait4, pid_t, upid, int __user *, stat_addr,
++		int, options, struct rusage __user *, ru)
++{
++	return rbb_ksys_wait4(upid, stat_addr, options, ru);
++}
++
+ #ifdef __ARCH_WANT_SYS_WAITPID
+ 
+ /*
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 99076db..ffd343b 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -2903,6 +2903,21 @@ SYSCALL_DEFINE0(vfork)
+ }
+ #endif
+ 
++long rbb_ksys_clone(unsigned long, unsigned long, int*, int*, unsigned long);
++long rbb_ksys_clone(unsigned long clone_flags, unsigned long newsp, int __user *parent_tidptr, int __user *child_tidptr, unsigned long tls) {
++	struct kernel_clone_args args = {
++		.flags		= (lower_32_bits(clone_flags) & ~CSIGNAL),
++		.pidfd		= parent_tidptr,
++		.child_tid	= child_tidptr,
++		.parent_tid	= parent_tidptr,
++		.exit_signal	= (lower_32_bits(clone_flags) & CSIGNAL),
++		.stack		= newsp,
++		.tls		= tls,
++	};
++
++	return kernel_clone(&args);
++}
++
+ #ifdef __ARCH_WANT_SYS_CLONE
+ #ifdef CONFIG_CLONE_BACKWARDS
+ SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+@@ -2927,17 +2942,7 @@ SYSCALL_DEFINE5(clone, unsigned long, clone_flags, unsigned long, newsp,
+ 		 unsigned long, tls)
+ #endif
+ {
+-	struct kernel_clone_args args = {
+-		.flags		= (lower_32_bits(clone_flags) & ~CSIGNAL),
+-		.pidfd		= parent_tidptr,
+-		.child_tid	= child_tidptr,
+-		.parent_tid	= parent_tidptr,
+-		.exit_signal	= (lower_32_bits(clone_flags) & CSIGNAL),
+-		.stack		= newsp,
+-		.tls		= tls,
+-	};
+-
+-	return kernel_clone(&args);
++	return rbb_ksys_clone(clone_flags, newsp, parent_tidptr, child_tidptr, tls);
+ }
+ #endif
+ 
+diff --git a/kernel/futex/syscalls.c b/kernel/futex/syscalls.c
+index 4b6da91..4690173 100644
+--- a/kernel/futex/syscalls.c
++++ b/kernel/futex/syscalls.c
+@@ -25,8 +25,8 @@
+  * @head:	pointer to the list-head
+  * @len:	length of the list-head, as userspace expects
+  */
+-SYSCALL_DEFINE2(set_robust_list, struct robust_list_head __user *, head,
+-		size_t, len)
++long rbb_ksys_set_robust_list(struct robust_list_head*, size_t);
++long rbb_ksys_set_robust_list(struct robust_list_head __user *head, size_t len)
+ {
+ 	/*
+ 	 * The kernel knows only one size for now:
+@@ -39,6 +39,12 @@ SYSCALL_DEFINE2(set_robust_list, struct robust_list_head __user *, head,
+ 	return 0;
+ }
+ 
++SYSCALL_DEFINE2(set_robust_list, struct robust_list_head __user *, head,
++		size_t, len)
++{
++	return rbb_ksys_set_robust_list(head, len);
++}
++
+ /**
+  * sys_get_robust_list() - Get the robust-futex list head of a task
+  * @pid:	pid of the process [zero for current task]
+@@ -157,9 +163,10 @@ futex_init_timeout(u32 cmd, u32 op, struct timespec64 *ts, ktime_t *t)
+ 	return 0;
+ }
+ 
+-SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
+-		const struct __kernel_timespec __user *, utime,
+-		u32 __user *, uaddr2, u32, val3)
++long rbb_ksys_futex(u32*, int, u32, const struct __kernel_timespec*, u32*, u32);
++long rbb_ksys_futex(u32 __user *uaddr, int op, u32 val,
++		const struct __kernel_timespec __user * utime,
++		u32 __user *uaddr2, u32 val3)
+ {
+ 	int ret, cmd = op & FUTEX_CMD_MASK;
+ 	ktime_t t, *tp = NULL;
+@@ -179,6 +186,14 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
+ 	return do_futex(uaddr, op, val, tp, uaddr2, (unsigned long)utime, val3);
+ }
+ 
++
++SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
++		const struct __kernel_timespec __user *, utime,
++		u32 __user *, uaddr2, u32, val3)
++{
++	return rbb_ksys_futex(uaddr, op, val, utime, uaddr2, val3);
++}
++
+ /**
+  * futex_parse_waitv - Parse a waitv array from userspace
+  * @futexv:	Kernel side list of waiters to be filled
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 1f9dd41..bd3884f 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -3190,9 +3190,8 @@ int set_compat_user_sigmask(const compat_sigset_t __user *umask,
+  *  @oset: previous value of signal mask if non-null
+  *  @sigsetsize: size of sigset_t type
+  */
+-SYSCALL_DEFINE4(rt_sigprocmask, int, how, sigset_t __user *, nset,
+-		sigset_t __user *, oset, size_t, sigsetsize)
+-{
++long rbb_ksys_rt_sigprocmask(int, sigset_t*, sigset_t*, size_t);
++long rbb_ksys_rt_sigprocmask(int how, sigset_t __user *nset, sigset_t __user *oset, size_t sigsetsize) {
+ 	sigset_t old_set, new_set;
+ 	int error;
+ 
+@@ -3220,6 +3219,12 @@ SYSCALL_DEFINE4(rt_sigprocmask, int, how, sigset_t __user *, nset,
+ 	return 0;
+ }
+ 
++SYSCALL_DEFINE4(rt_sigprocmask, int, how, sigset_t __user *, nset,
++		sigset_t __user *, oset, size_t, sigsetsize)
++{
++	return rbb_ksys_rt_sigprocmask(how, nset, oset, sigsetsize);
++}
++
+ #ifdef CONFIG_COMPAT
+ COMPAT_SYSCALL_DEFINE4(rt_sigprocmask, int, how, compat_sigset_t __user *, nset,
+ 		compat_sigset_t __user *, oset, compat_size_t, sigsetsize)
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 3a2df1b..6a802fb 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -964,11 +964,18 @@ SYSCALL_DEFINE1(setfsgid, gid_t, gid)
+  *
+  * This is SMP safe as current->tgid does not change.
+  */
+-SYSCALL_DEFINE0(getpid)
++
++long rbb_ksys_getpid(void);
++long rbb_ksys_getpid(void)
+ {
+ 	return task_tgid_vnr(current);
+ }
+ 
++SYSCALL_DEFINE0(getpid)
++{
++	return rbb_ksys_getpid();
++}
++
+ /* Thread ID - the internal kernel "pid" */
+ SYSCALL_DEFINE0(gettid)
+ {
+@@ -981,7 +988,8 @@ SYSCALL_DEFINE0(gettid)
+  * value of ->real_parent under rcu_read_lock(), see
+  * release_task()->call_rcu(delayed_put_task_struct).
+  */
+-SYSCALL_DEFINE0(getppid)
++long rbb_ksys_getppid(void);
++long rbb_ksys_getppid(void)
+ {
+ 	int pid;
+ 
+@@ -992,18 +1000,29 @@ SYSCALL_DEFINE0(getppid)
+ 	return pid;
+ }
+ 
++SYSCALL_DEFINE0(getppid)
++{
++	return rbb_ksys_getppid();
++}
++
+ SYSCALL_DEFINE0(getuid)
+ {
+ 	/* Only we change this so SMP safe */
+ 	return from_kuid_munged(current_user_ns(), current_uid());
+ }
+ 
+-SYSCALL_DEFINE0(geteuid)
++long rbb_ksys_geteuid(void);
++long rbb_ksys_geteuid(void)
+ {
+ 	/* Only we change this so SMP safe */
+ 	return from_kuid_munged(current_user_ns(), current_euid());
+ }
+ 
++SYSCALL_DEFINE0(geteuid)
++{
++	return rbb_ksys_geteuid();
++}
++
+ SYSCALL_DEFINE0(getgid)
+ {
+ 	/* Only we change this so SMP safe */
+@@ -1079,7 +1098,8 @@ COMPAT_SYSCALL_DEFINE1(times, struct compat_tms __user *, tbuf)
+  *
+  * !PF_FORKNOEXEC check to conform completely to POSIX.
+  */
+-SYSCALL_DEFINE2(setpgid, pid_t, pid, pid_t, pgid)
++long rbb_ksys_setpgid(pid_t, pid_t);
++long rbb_ksys_setpgid(pid_t pid, pid_t pgid)
+ {
+ 	struct task_struct *p;
+ 	struct task_struct *group_leader = current->group_leader;
+@@ -1150,6 +1170,11 @@ SYSCALL_DEFINE2(setpgid, pid_t, pid, pid_t, pgid)
+ 	return err;
+ }
+ 
++SYSCALL_DEFINE2(setpgid, pid_t, pid, pid_t, pgid)
++{
++	return rbb_ksys_setpgid(pid, pgid);
++}
++
+ static int do_getpgid(pid_t pid)
+ {
+ 	struct task_struct *p;
+@@ -1903,12 +1928,18 @@ COMPAT_SYSCALL_DEFINE2(getrusage, int, who, struct compat_rusage __user *, ru)
+ }
+ #endif
+ 
+-SYSCALL_DEFINE1(umask, int, mask)
++long rbb_ksys_umask(int);
++long rbb_ksys_umask(int mask)
+ {
+ 	mask = xchg(&current->fs->umask, mask & S_IRWXUGO);
+ 	return mask;
+ }
+ 
++SYSCALL_DEFINE1(umask, int, mask)
++{
++	return rbb_ksys_umask(mask);
++}
++
+ static int prctl_set_mm_exe_file(struct mm_struct *mm, unsigned int fd)
+ {
+ 	struct fd exe;
+diff --git a/kernel/time/posix-timers.c b/kernel/time/posix-timers.c
+index b924f0f..ae6b5b0 100644
+--- a/kernel/time/posix-timers.c
++++ b/kernel/time/posix-timers.c
+@@ -1129,8 +1129,8 @@ SYSCALL_DEFINE2(clock_settime, const clockid_t, which_clock,
+ 	return kc->clock_set(which_clock, &new_tp);
+ }
+ 
+-SYSCALL_DEFINE2(clock_gettime, const clockid_t, which_clock,
+-		struct __kernel_timespec __user *, tp)
++long rbb_ksys_clock_gettime(const clockid_t, struct __kernel_timespec*);
++long rbb_ksys_clock_gettime(const clockid_t which_clock, struct __kernel_timespec __user *tp)
+ {
+ 	const struct k_clock *kc = clockid_to_kclock(which_clock);
+ 	struct timespec64 kernel_tp;
+@@ -1147,6 +1147,12 @@ SYSCALL_DEFINE2(clock_gettime, const clockid_t, which_clock,
+ 	return error;
+ }
+ 
++SYSCALL_DEFINE2(clock_gettime, const clockid_t, which_clock,
++		struct __kernel_timespec __user *, tp)
++{
++	return rbb_ksys_clock_gettime(which_clock, tp);
++}
++
+ int do_clock_adjtime(const clockid_t which_clock, struct __kernel_timex * ktx)
+ {
+ 	const struct k_clock *kc = clockid_to_kclock(which_clock);
+diff --git a/kernel/time/time.c b/kernel/time/time.c
+index 642647f..d0f589c 100644
+--- a/kernel/time/time.c
++++ b/kernel/time/time.c
+@@ -59,7 +59,9 @@ EXPORT_SYMBOL(sys_tz);
+  * why not move it into the appropriate arch directory (for those
+  * architectures that need it).
+  */
+-SYSCALL_DEFINE1(time, __kernel_old_time_t __user *, tloc)
++
++long rbb_ksys_time(__kernel_old_time_t*);
++long rbb_ksys_time(__kernel_old_time_t __user *tloc)
+ {
+ 	__kernel_old_time_t i = (__kernel_old_time_t)ktime_get_real_seconds();
+ 
+@@ -71,6 +73,11 @@ SYSCALL_DEFINE1(time, __kernel_old_time_t __user *, tloc)
+ 	return i;
+ }
+ 
++SYSCALL_DEFINE1(time, __kernel_old_time_t __user *, tloc)
++{
++	return rbb_ksys_time(tloc);
++}
++
+ /*
+  * sys_stime() can be implemented in user-level using
+  * sys_settimeofday().  Is this for backwards compatibility?  If so,
+@@ -137,8 +144,8 @@ SYSCALL_DEFINE1(stime32, old_time32_t __user *, tptr)
+ #endif /* __ARCH_WANT_SYS_TIME32 */
+ #endif
+ 
+-SYSCALL_DEFINE2(gettimeofday, struct __kernel_old_timeval __user *, tv,
+-		struct timezone __user *, tz)
++long rbb_ksys_gettimeofday(struct __kernel_old_timeval*, struct timezone*);
++long rbb_ksys_gettimeofday(struct __kernel_old_timeval __user * tv, struct timezone __user * tz)
+ {
+ 	if (likely(tv != NULL)) {
+ 		struct timespec64 ts;
+@@ -155,6 +162,12 @@ SYSCALL_DEFINE2(gettimeofday, struct __kernel_old_timeval __user *, tv,
+ 	return 0;
+ }
+ 
++SYSCALL_DEFINE2(gettimeofday, struct __kernel_old_timeval __user *, tv,
++		struct timezone __user *, tz)
++{
++	return rbb_ksys_gettimeofday(tv, tz);
++}
++
+ /*
+  * In case for some reason the CMOS clock has not already been running
+  * in UTC, but in some local time: The first time we set the timezone,
+diff --git a/mm/madvise.c b/mm/madvise.c
+index a778934..362ad27 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -1476,9 +1476,14 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
+ 	return error;
+ }
+ 
++long rbb_ksys_madvise(unsigned long, size_t, int);
++long rbb_ksys_madvise(unsigned long start, size_t len_in, int behavior) {
++	return do_madvise(current->mm, start, len_in, behavior);
++}
++
+ SYSCALL_DEFINE3(madvise, unsigned long, start, size_t, len_in, int, behavior)
+ {
+-	return do_madvise(current->mm, start, len_in, behavior);
++	return rbb_ksys_madvise(start, len_in, behavior);
+ }
+ 
+ SYSCALL_DEFINE5(process_madvise, int, pidfd, const struct iovec __user *, vec,
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 8c6cd88..fd3d731 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -835,10 +835,15 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ 	return error;
+ }
+ 
++long rbb_ksys_mprotect(unsigned long, size_t, unsigned long);
++long rbb_ksys_mprotect(unsigned long start, size_t len, unsigned long prot) {
++	return do_mprotect_pkey(start, len, prot, -1);
++}
++
+ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+ 		unsigned long, prot)
+ {
+-	return do_mprotect_pkey(start, len, prot, -1);
++	return rbb_ksys_mprotect(start, len, prot);
+ }
+ 
+ #ifdef CONFIG_ARCH_HAS_PKEYS
+diff --git a/net/socket.c b/net/socket.c
+index e416920..9bdcbc3 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -1715,9 +1715,14 @@ int __sys_socket(int family, int type, int protocol)
+ 	return sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));
+ }
+ 
++long rbb_ksys_socket(int, int, int);
++long rbb_ksys_socket(int family, int type, int protocol) {
++	return __sys_socket(family, type, protocol);
++}
++
+ SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
+ {
+-	return __sys_socket(family, type, protocol);
++	return rbb_ksys_socket(family, type, protocol);
+ }
+ 
+ /*
+@@ -1853,9 +1858,15 @@ int __sys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen)
+ 	return err;
+ }
+ 
++long rbb_ksys_bind(int, struct sockaddr*, int);
++long rbb_ksys_bind(int fd, struct sockaddr __user *umyaddr, int addrlen) {
++	return __sys_bind(fd, umyaddr, addrlen);
++}
++
++
+ SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
+ {
+-	return __sys_bind(fd, umyaddr, addrlen);
++	return rbb_ksys_bind(fd, umyaddr, addrlen);
+ }
+ 
+ /*
+@@ -2005,10 +2016,16 @@ int __sys_accept4(int fd, struct sockaddr __user *upeer_sockaddr,
+ 	return ret;
+ }
+ 
++long rbb_ksys_accept4(int, struct sockaddr*, int*, int);
++long rbb_ksys_accept4(int fd, struct sockaddr __user *upeer_sockaddr, int __user *upeer_addrlen, int flags)
++{
++	return __sys_accept4(fd, upeer_sockaddr, upeer_addrlen, flags);
++}
++
+ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
+ 		int __user *, upeer_addrlen, int, flags)
+ {
+-	return __sys_accept4(fd, upeer_sockaddr, upeer_addrlen, flags);
++	return rbb_ksys_accept4(fd, upeer_sockaddr, upeer_addrlen, flags);
+ }
+ 
+ SYSCALL_DEFINE3(accept, int, fd, struct sockaddr __user *, upeer_sockaddr,
+@@ -2197,11 +2214,17 @@ int __sys_sendto(int fd, void __user *buff, size_t len, unsigned int flags,
+ 	return err;
+ }
+ 
++long rbb_ksys_sendto(int, void*, size_t, unsigned int, struct sockaddr*, int);
++long rbb_ksys_sendto(int fd, void __user *buff, size_t len, unsigned int flags, struct sockaddr __user *addr, int addr_len)
++{
++	return __sys_sendto(fd, buff, len, flags, addr, addr_len);
++}
++
+ SYSCALL_DEFINE6(sendto, int, fd, void __user *, buff, size_t, len,
+ 		unsigned int, flags, struct sockaddr __user *, addr,
+ 		int, addr_len)
+ {
+-	return __sys_sendto(fd, buff, len, flags, addr, addr_len);
++	return rbb_ksys_sendto(fd, buff, len, flags, addr, addr_len);
+ }
+ 
+ /*
+@@ -2254,11 +2277,17 @@ int __sys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags,
+ 	return err;
+ }
+ 
++long rbb_ksys_recvfrom(int, void*, size_t, unsigned int, struct sockaddr*, int*);
++long rbb_ksys_recvfrom(int fd, void __user *ubuf, size_t size, unsigned int flags, struct sockaddr __user *addr, int __user *addr_len)
++{
++	return __sys_recvfrom(fd, ubuf, size, flags, addr, addr_len);
++}
++
+ SYSCALL_DEFINE6(recvfrom, int, fd, void __user *, ubuf, size_t, size,
+ 		unsigned int, flags, struct sockaddr __user *, addr,
+ 		int __user *, addr_len)
+ {
+-	return __sys_recvfrom(fd, ubuf, size, flags, addr, addr_len);
++	return rbb_ksys_recvfrom(fd, ubuf, size, flags, addr, addr_len);
+ }
+ 
+ /*
+@@ -2338,10 +2367,16 @@ int __sys_setsockopt(int fd, int level, int optname, char __user *user_optval,
+ 	return err;
+ }
+ 
++long rbb_ksys_setsockopt(int, int, int, char*, int);
++long rbb_ksys_setsockopt(int fd, int level, int optname, char __user *optval, int optlen)
++{
++	return __sys_setsockopt(fd, level, optname, optval, optlen);
++}
++
+ SYSCALL_DEFINE5(setsockopt, int, fd, int, level, int, optname,
+ 		char __user *, optval, int, optlen)
+ {
+-	return __sys_setsockopt(fd, level, optname, optval, optlen);
++	return rbb_ksys_setsockopt(fd, level, optname, optval, optlen);
+ }
+ 
+ INDIRECT_CALLABLE_DECLARE(bool tcp_bpf_bypass_getsockopt(int level,

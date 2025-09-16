@@ -1,0 +1,422 @@
+diff --git a/Makefile.am b/Makefile.am
+index 7749442..59ef67e 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -12,7 +12,8 @@ TOOLS = \
+ 		massif \
+ 		dhat \
+ 		lackey \
+-		none
++		none \
++		syscall_tracker
+ 
+ EXP_TOOLS = \
+ 		exp-bbv
+diff --git a/configure.ac b/configure.ac
+index ec4170c..b95f06a 100755
+--- a/configure.ac
++++ b/configure.ac
+@@ -5752,7 +5752,10 @@ AC_CONFIG_FILES([drd/tests/filter_xml_and_thread_no],
+                 [chmod +x drd/tests/filter_xml_and_thread_no])
+ AC_CONFIG_FILES([helgrind/tests/filter_stderr],
+                 [chmod +x helgrind/tests/filter_stderr])
+-AC_OUTPUT
++AC_OUTPUT([
++           syscall_tracker/Makefile
++           syscall_tracker/tests/Makefile
++])
+ 
+ cat<<EOF
+ 
+diff --git a/syscall_tracker/Makefile.am b/syscall_tracker/Makefile.am
+new file mode 100644
+index 0000000..d2ea664
+--- /dev/null
++++ b/syscall_tracker/Makefile.am
+@@ -0,0 +1,56 @@
++include $(top_srcdir)/Makefile.tool.am
++
++EXTRA_DIST = docs/st-manual.xml
++
++#----------------------------------------------------------------------------
++# syscall_tracker-<platform>
++#----------------------------------------------------------------------------
++
++noinst_PROGRAMS  = syscall_tracker-@VGCONF_ARCH_PRI@-@VGCONF_OS@
++if VGCONF_HAVE_PLATFORM_SEC
++noinst_PROGRAMS += syscall_tracker-@VGCONF_ARCH_SEC@-@VGCONF_OS@
++endif
++
++NONE_SOURCES_COMMON = st_main.c
++
++syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_SOURCES      = \
++	$(NONE_SOURCES_COMMON)
++syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_CPPFLAGS     = \
++	$(AM_CPPFLAGS_@VGCONF_PLATFORM_PRI_CAPS@)
++syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_CFLAGS       = $(LTO_CFLAGS) \
++	$(AM_CFLAGS_@VGCONF_PLATFORM_PRI_CAPS@)
++syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_DEPENDENCIES = \
++	$(TOOL_DEPENDENCIES_@VGCONF_PLATFORM_PRI_CAPS@)
++syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_LDADD        = \
++	$(TOOL_LDADD_@VGCONF_PLATFORM_PRI_CAPS@)
++syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_LDFLAGS      = \
++	$(TOOL_LDFLAGS_@VGCONF_PLATFORM_PRI_CAPS@)
++syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_LINK = \
++	$(top_builddir)/coregrind/link_tool_exe_@VGCONF_OS@ \
++	@VALT_LOAD_ADDRESS_PRI@ \
++	$(LINK) \
++	$(syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_CFLAGS) \
++	$(syscall_tracker_@VGCONF_ARCH_PRI@_@VGCONF_OS@_LDFLAGS)
++
++if VGCONF_HAVE_PLATFORM_SEC
++syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_SOURCES      = \
++	$(NONE_SOURCES_COMMON)
++syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_CPPFLAGS     = \
++	$(AM_CPPFLAGS_@VGCONF_PLATFORM_SEC_CAPS@)
++syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_CFLAGS       = $(LTO_CFLAGS) \
++	$(AM_CFLAGS_@VGCONF_PLATFORM_SEC_CAPS@)
++syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_DEPENDENCIES = \
++	$(TOOL_DEPENDENCIES_@VGCONF_PLATFORM_SEC_CAPS@)
++syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_LDADD        = \
++	$(TOOL_LDADD_@VGCONF_PLATFORM_SEC_CAPS@)
++syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_LDFLAGS      = \
++	$(TOOL_LDFLAGS_@VGCONF_PLATFORM_SEC_CAPS@)
++syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_LINK = \
++	$(top_builddir)/coregrind/link_tool_exe_@VGCONF_OS@ \
++	@VALT_LOAD_ADDRESS_SEC@ \
++	$(LINK) \
++	$(syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_CFLAGS) \
++	$(syscall_tracker_@VGCONF_ARCH_SEC@_@VGCONF_OS@_LDFLAGS)
++endif
++
++
+diff --git a/syscall_tracker/st_main.c b/syscall_tracker/st_main.c
+new file mode 100644
+index 0000000..8c05dc1
+--- /dev/null
++++ b/syscall_tracker/st_main.c
+@@ -0,0 +1,321 @@
++#include "pub_tool_basics.h"
++#include "pub_tool_libcproc.h"
++#include "pub_tool_machine.h"
++#include "pub_tool_mallocfree.h"
++#include "pub_tool_options.h"
++#include "pub_tool_tooliface.h"
++#include "pub_tool_libcassert.h"
++#include "pub_tool_libcfile.h"
++
++
++/*------------------------------------------------------------*/
++/*--- Command line arguments                               ---*/
++/*------------------------------------------------------------*/
++
++static const HChar* clo_pos_file_path = NULL;
++static int clo_seg_len = 32;
++static const HChar* clo_out_file_path = NULL;
++
++static Bool st_process_cmd_line_option(const HChar* arg)
++{
++   if VG_STR_CLO(arg, "--pos-file", clo_pos_file_path)
++      return True;
++   else if VG_BINT_CLO(arg, "--seg-len", clo_seg_len, 2, 4096)
++      return True;
++   else if VG_STR_CLO(arg, "--out-file", clo_out_file_path)
++      return True;
++   else
++      return False;
++}
++
++static void st_print_usage(void)
++{
++   VG_(printf)(
++"    --pos-file=<path>     path to position file\n"
++"    --seg-len=<length>    maximum length of single segment [32]\n"
++"    --out-file=<path>     path to output file\n"
++   );
++}
++
++static void st_print_debug_usage(void)
++{
++   VG_(printf)("    (none)\n");
++}
++
++
++/*------------------------------------------------------------*/
++/*--- Position list                                        ---*/
++/*------------------------------------------------------------*/
++
++static unsigned long poslist_len;
++static unsigned long *poslist_data; 
++
++static Bool read_next_ulong(int fd, unsigned long *result) {
++   *result = 0;
++   Bool read_sth = False;
++
++   while (1) {
++      char buffer;
++      int res = VG_(read)(fd, &buffer, 1);
++      if (res < 0)
++         return False;
++      else if (res == 0)
++         return read_sth;
++      
++      if (buffer >= '0' && buffer <= '9') {
++         *result = 10 * *result + buffer - '0';
++         read_sth = True;
++      }
++      else if (read_sth)
++         return True;
++   }
++}
++
++static Bool read_list_of_positions(const HChar* path) {
++   int fd;
++
++   SysRes sres = VG_(open)(path, VKI_O_RDONLY, 0);
++   if (sr_isError(sres)) {
++      VG_(message)(Vg_FailMsg, "Cannot open position file\n");
++      return False;
++   }
++   fd = sr_Res(sres);
++
++   if (!read_next_ulong(fd, &poslist_len)) {
++      VG_(message)(Vg_FailMsg, "Invalid position file\n");
++      return False;
++   }
++   poslist_data = VG_(malloc)("st_position_list", sizeof(unsigned long) * poslist_len);
++
++   for (int i=0; i<poslist_len; i++) {
++      if (!read_next_ulong(fd, &poslist_data[i])) {
++         VG_(message)(Vg_FailMsg, "Invalid position file\n");
++         return False;
++      }
++   }
++
++   VG_(close)(fd);
++   return True;
++}
++
++static Bool is_on_the_list(long item) {
++   for (int i=0; i<poslist_len; i++)
++      if (poslist_data[i] == item)
++         return True;
++   return False;
++}
++
++
++/*------------------------------------------------------------*/
++/*--- Thread-local data                                    ---*/
++/*------------------------------------------------------------*/
++
++struct TLData {
++   ThreadId tid;
++   unsigned long *out_buf;
++   int out_cnt;
++   int segment_cnt;
++   char *format_buf;
++   unsigned long pre_buf[8], pre_buf_copy[8];
++   int pre_cnt, pre_cnt_copy;
++};
++
++static volatile int tls_len = 0;
++static struct TLData *volatile tls = NULL;
++static struct TLData *volatile current_tls = NULL;
++
++static void st_track_start_client_code(ThreadId tid, ULong blocks_dispatched)
++{
++   // try to find existing TLData
++   for (int i=0; i<tls_len; i++)
++      if (tls[i].tid == tid) {
++         current_tls = &tls[i];
++         return;
++      }
++   
++   // allocate data for new thread
++   tls = VG_(realloc)("TLData", tls, sizeof(struct TLData) * ++tls_len);
++   current_tls = &tls[tls_len-1];
++   current_tls->tid = tid;
++
++   // init data for a new thread
++   current_tls->out_buf = VG_(malloc)("output_buffer", (clo_seg_len + 2) * sizeof(unsigned long));
++   current_tls->out_cnt = 0;
++   current_tls->segment_cnt = -1;
++   current_tls->format_buf = VG_(malloc)("format_buffer", 64);
++   current_tls->pre_cnt = 0;
++}
++
++
++/*------------------------------------------------------------*/
++/*--- Output collector                                     ---*/
++/*------------------------------------------------------------*/
++
++int out_file_fd;
++
++static Bool open_output_file(const HChar* path, int buf_size)
++{
++   out_file_fd = VG_(fd_open)(path, VKI_O_WRONLY | VKI_O_CREAT | VKI_O_TRUNC, VKI_S_IRUSR | VKI_S_IWUSR);
++   if (out_file_fd < 0) {
++      VG_(message)(Vg_FailMsg, "Cannot open output file\n");
++      return False;
++   }
++   return True;
++}
++
++static void begin_new_segment(void)
++{
++   VG_(memcpy)(current_tls->pre_buf_copy, current_tls->pre_buf, sizeof(unsigned long) * 8);
++   current_tls->pre_cnt_copy = current_tls->pre_cnt;
++   current_tls->out_cnt = 0;
++}
++
++static void add_next_instr(unsigned long addr)
++{
++   current_tls->pre_cnt = (current_tls->pre_cnt + 1) % 8;
++   current_tls->pre_buf[current_tls->pre_cnt] = addr;
++}
++
++static void add_next_segment_instr(unsigned long addr)
++{
++   current_tls->out_buf[current_tls->out_cnt++] = addr;
++}
++
++static void end_segment(int success) {
++   int len = VG_(sprintf)(current_tls->format_buf, "SEGMENT 0x%lx %s\n", current_tls->out_buf[0], success?"GOOD":"BAD");
++   VG_(write)(out_file_fd, current_tls->format_buf, len);
++   
++   for (int i=(current_tls->pre_cnt_copy+1)%8; i!=current_tls->pre_cnt_copy; i=(i+1)%8) {
++      len = VG_(sprintf)(current_tls->format_buf, "0x%lx\n", current_tls->pre_buf_copy[i]);
++      VG_(write)(out_file_fd, current_tls->format_buf, len);
++   }
++   VG_(write)(out_file_fd, "CALL\n", 5);
++   for (int i=1; i<current_tls->out_cnt; i++) {
++      len = VG_(sprintf)(current_tls->format_buf, "0x%lx\n", current_tls->out_buf[i]);
++      VG_(write)(out_file_fd, current_tls->format_buf, len);
++   }
++
++   VG_(write)(out_file_fd, "END\n", 4);
++
++}
++
++static void close_output_file(void)
++{
++   VG_(close)(out_file_fd);
++}
++
++
++
++/*------------------------------------------------------------*/
++/*--- Post-syscall tracer                                  ---*/
++/*------------------------------------------------------------*/
++
++static void st_pre_normal_instr(unsigned long addr) {
++   add_next_instr(addr);
++   if (current_tls->segment_cnt != -1) {
++      if (current_tls->segment_cnt == 0) {
++         current_tls->segment_cnt = -1;
++         end_segment(0);
++      }
++      else {
++         current_tls->segment_cnt--;
++         add_next_segment_instr(addr);
++      }
++   }
++}
++
++static void st_pre_syscall_instr(unsigned long addr) {
++   add_next_instr(addr);
++   if (current_tls->segment_cnt == -1) {
++      begin_new_segment();
++      current_tls->segment_cnt = clo_seg_len;
++   }
++   else {
++      add_next_segment_instr(addr);
++      end_segment(1);
++      current_tls->segment_cnt = clo_seg_len;
++      begin_new_segment();
++   }
++   add_next_segment_instr(addr);
++}
++
++static IRSB* st_instrument(VgCallbackClosure*     closure,
++                           IRSB*                  sbIn,
++                           const VexGuestLayout*  layout,
++                           const VexGuestExtents* vge,
++                           const VexArchInfo*     archinfo_host,
++                           IRType                 gWordTy,
++                           IRType                 hWordTy)
++{
++   IRSB* sbOut = deepCopyIRSBExceptStmts(sbIn);
++
++   // VG_(emit)("New superblock%s:\n", (sbIn->jumpkind == Ijk_Sys_syscall)?(" (ended with syscall)"):(""));
++
++   int it = 0;
++   while (it < sbIn->stmts_used && sbIn->stmts[it]->tag != Ist_IMark)
++      addStmtToIRSB(sbOut, sbIn->stmts[it++]);
++
++   while (it < sbIn->stmts_used) {
++      // next actual instruction
++      addStmtToIRSB(sbOut, sbIn->stmts[it]);
++
++      // add the instrumentation
++      IRExpr* address_expr = IRExpr_Const(IRConst_U64(sbIn->stmts[it]->Ist.IMark.addr));
++      IRDirty* di;
++      if (is_on_the_list(sbIn->stmts[it]->Ist.IMark.addr))
++         di = unsafeIRDirty_0_N(0, "st_pre_syscall_instr", VG_(fnptr_to_fnentry)(&st_pre_syscall_instr), mkIRExprVec_1(address_expr));
++      else
++         di = unsafeIRDirty_0_N(0, "st_pre_normal_instr", VG_(fnptr_to_fnentry)(&st_pre_normal_instr), mkIRExprVec_1(address_expr));
++      addStmtToIRSB(sbOut, IRStmt_Dirty(di));
++
++      // copy all sub-statements
++      for (it++; it < sbIn->stmts_used && sbIn->stmts[it]->tag != Ist_IMark;
++           it++)
++         addStmtToIRSB(sbOut, sbIn->stmts[it]);
++   }
++
++   return sbOut;
++}
++
++
++/*------------------------------------------------------------*/
++/*--- Initialization / cleanup                             ---*/
++/*------------------------------------------------------------*/
++
++static void st_post_clo_init(void) 
++{
++   if (clo_pos_file_path == NULL || clo_out_file_path == NULL) {
++      st_print_usage();
++      VG_(exit)(1);
++   }
++
++   if (!read_list_of_positions(clo_pos_file_path))
++      VG_(exit)(1);
++   VG_(message)(Vg_UserMsg, "Loaded %ld syscall positions\n", poslist_len);
++
++   if (!open_output_file(clo_out_file_path, clo_seg_len + 2))
++      VG_(exit)(1);
++}
++
++static void st_fini(Int exitcode) {
++   close_output_file();
++}
++
++static void st_pre_clo_init(void)
++{
++   VG_(details_name)("Syscall tracker");
++   VG_(details_version)(NULL);
++   VG_(details_description)(
++      "tracker of syscalls and instructions executed after them");
++   VG_(details_copyright_author)("GNU GPL'd, by Bartlomiej Waclawik");
++   VG_(details_bug_reports_to)("NULL");
++
++   VG_(basic_tool_funcs)(st_post_clo_init, st_instrument, st_fini);
++
++   VG_(needs_core_errors)(False);
++   VG_(needs_command_line_options)(st_process_cmd_line_option, st_print_usage, st_print_debug_usage);
++
++   VG_(track_start_client_code)(st_track_start_client_code);
++}
++
++VG_DETERMINE_INTERFACE_VERSION(st_pre_clo_init)
+diff --git a/syscall_tracker/tests/Makefile.am b/syscall_tracker/tests/Makefile.am
+new file mode 100644
+index 0000000..e69de29
