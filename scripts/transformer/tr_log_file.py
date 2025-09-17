@@ -19,9 +19,9 @@ def load_log_file(log_file_path: str, length_threshold: int, code_sections:dict[
     current_node_id, current_chain, current_pre_chain, pre_mode, chain_is_good = None, None, None, None, None # reader state
 
     with open(log_file_path, 'r') as log_file:
-        for line in log_file:
+        for line in sorted(log_file, key=lambda l : l.split()[0]): # sorted() is guaranteed to be stable
             insn_addr = None
-            tokens = line.split()
+            tokens = line.split()[1:]
 
             if tokens[0] == "SEGMENT": # begining of new segment - initialize reader state
                 insn_addr = int(tokens[1], base=0)

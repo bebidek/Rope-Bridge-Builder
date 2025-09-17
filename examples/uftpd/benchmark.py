@@ -26,7 +26,7 @@ def subprocess_func(pipe: multiprocessing.connection.Connection):
         server = None
         server = subprocess.Popen([f'./{old_or_new}_uftpd', '-n', SAMPLE_FILES_DIR, '-l', 'none', '-o', f'tftp={TFTP_PORT}'], preexec_fn=os.setpgrp, env=custom_env)
 
-        time.sleep(0.5)
+        time.sleep(1)
         pipe.send(server.pid) # signal server ready to start
         assert server.wait() == 0
 

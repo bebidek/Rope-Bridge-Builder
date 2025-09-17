@@ -92,10 +92,10 @@ index 0000000..d2ea664
 +
 diff --git a/syscall_tracker/st_main.c b/syscall_tracker/st_main.c
 new file mode 100644
-index 0000000..8c05dc1
+index 0000000..043b92f
 --- /dev/null
 +++ b/syscall_tracker/st_main.c
-@@ -0,0 +1,321 @@
+@@ -0,0 +1,326 @@
 +#include "pub_tool_basics.h"
 +#include "pub_tool_libcproc.h"
 +#include "pub_tool_machine.h"
@@ -104,6 +104,7 @@ index 0000000..8c05dc1
 +#include "pub_tool_tooliface.h"
 +#include "pub_tool_libcassert.h"
 +#include "pub_tool_libcfile.h"
++#include "pub_tool_threadstate.h"
 +
 +
 +/*------------------------------------------------------------*/
@@ -210,6 +211,7 @@ index 0000000..8c05dc1
 +
 +struct TLData {
 +   ThreadId tid;
++   unsigned long actual_tid;
 +   unsigned long *out_buf;
 +   int out_cnt;
 +   int segment_cnt;
@@ -225,8 +227,9 @@ index 0000000..8c05dc1
 +static void st_track_start_client_code(ThreadId tid, ULong blocks_dispatched)
 +{
 +   // try to find existing TLData
++   unsigned int actual_tid = VG_(gettid)();
 +   for (int i=0; i<tls_len; i++)
-+      if (tls[i].tid == tid) {
++      if (tls[i].tid == tid && tls[i].actual_tid == actual_tid) {
 +         current_tls = &tls[i];
 +         return;
 +      }
@@ -237,6 +240,7 @@ index 0000000..8c05dc1
 +   current_tls->tid = tid;
 +
 +   // init data for a new thread
++   current_tls->actual_tid = actual_tid;
 +   current_tls->out_buf = VG_(malloc)("output_buffer", (clo_seg_len + 2) * sizeof(unsigned long));
 +   current_tls->out_cnt = 0;
 +   current_tls->segment_cnt = -1;
@@ -280,21 +284,22 @@ index 0000000..8c05dc1
 +}
 +
 +static void end_segment(int success) {
-+   int len = VG_(sprintf)(current_tls->format_buf, "SEGMENT 0x%lx %s\n", current_tls->out_buf[0], success?"GOOD":"BAD");
++   int len = VG_(sprintf)(current_tls->format_buf, "%lu SEGMENT 0x%lx %s\n", current_tls->actual_tid, current_tls->out_buf[0], success?"GOOD":"BAD");
 +   VG_(write)(out_file_fd, current_tls->format_buf, len);
 +   
 +   for (int i=(current_tls->pre_cnt_copy+1)%8; i!=current_tls->pre_cnt_copy; i=(i+1)%8) {
-+      len = VG_(sprintf)(current_tls->format_buf, "0x%lx\n", current_tls->pre_buf_copy[i]);
++      len = VG_(sprintf)(current_tls->format_buf, "%lu 0x%lx\n", current_tls->actual_tid, current_tls->pre_buf_copy[i]);
 +      VG_(write)(out_file_fd, current_tls->format_buf, len);
 +   }
-+   VG_(write)(out_file_fd, "CALL\n", 5);
++   len = VG_(sprintf)(current_tls->format_buf, "%lu CALL\n", current_tls->actual_tid);
++   VG_(write)(out_file_fd, current_tls->format_buf, len);
 +   for (int i=1; i<current_tls->out_cnt; i++) {
-+      len = VG_(sprintf)(current_tls->format_buf, "0x%lx\n", current_tls->out_buf[i]);
++      len = VG_(sprintf)(current_tls->format_buf, "%lu 0x%lx\n", current_tls->actual_tid, current_tls->out_buf[i]);
 +      VG_(write)(out_file_fd, current_tls->format_buf, len);
 +   }
 +
-+   VG_(write)(out_file_fd, "END\n", 4);
-+
++   len = VG_(sprintf)(current_tls->format_buf, "%lu END\n", current_tls->actual_tid);
++   VG_(write)(out_file_fd, current_tls->format_buf, len);
 +}
 +
 +static void close_output_file(void)
