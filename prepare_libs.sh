@@ -5,7 +5,7 @@ mkdir -p libs
 cd libs
 
 # GLIBC
-wget https://mirror.kumi.systems/gnu/glibc/glibc-2.40.tar.xz 
+wget https://ftp.man.poznan.pl/gnu/glibc/glibc-2.40.tar.xz 
 tar xf glibc-2.40.tar.xz
 cd glibc-2.40
 mkdir build
